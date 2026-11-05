@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Cache-Control" content="no-store">
+  <title>XGW DTLS-SRTP spike</title>
+</head>
+<body>
+  <h1>XGW spike</h1>
+  <p id="spike-status">Starting...</p>
+  <script>
+    const statusEl = document.getElementById("spike-status");
+    const params = new URLSearchParams(location.search);
+    const useMic = params.get("mic") === "1";
+    const useDc = params.get("dc") === "1";
+    const codec = (params.get("codec") || "opus").toLowerCase();
+    // Optional STUN so host mDNS-only offers still yield a usable srflx IP for
+    // Full ICE CreatePermission toward the browser (relay-only answers).
+    const stunUri = params.get("stun");
+    const iceServers = stunUri ? [{ urls: "stun:" + stunUri }] : [];
+    let pc = null;
+    let stream = null;
+    let dc = null;
+    let serverTrickleSince = 0;
+    let lastDebug = "";
+    let dcState = "-";
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    async function postCandidate(init) {
+      const resp = await fetch("/candidate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(init)
+      });
+      if (!resp.ok && resp.status !== 204) {
+        throw new Error("POST /candidate " + resp.status);
+      }
+    }
+
+    async function pollServerCandidates() {
+      const resp = await fetch("/candidates?since=" + serverTrickleSince);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data.candidates) {
+        for (const line of data.candidates) {
+          try {
+            await pc.addIceCandidate({ candidate: line, sdpMid: "0" });
+          } catch (err) {
+            console.warn("addIceCandidate failed", line, err);
+          }
+        }
+      }
+      if (typeof data.next === "number") {
+        serverTrickleSince = data.next;
+      }
+    }
+
+    function showPcState() {
+      setStatus(
+        "ICE: " + pc.iceConnectionState + " / conn: " + pc.connectionState + lastDebug
+      );
+    }
+
+    function senderTrack() {
+      const sender = pc && pc.getSenders ? pc.getSenders()[0] : null;
+      return sender && sender.track ? sender.track : null;
+    }
+
+    function fmtBool(value) {
+      return value === undefined || value === null ? "?" : value ? "1" : "0";
+    }
+
+    function fmtValue(value) {
+      return value === undefined || value === null || value === "" ? "?" : String(value);
+    }
+
+    function selectedCandidatePair(stats) {
+      for (const report of stats.values()) {
+        if (report.type === "transport" && report.selectedCandidatePairId) {
+          return stats.get(report.selectedCandidatePairId) || null;
+        }
+      }
+
+      for (const report of stats.values()) {
+        if (report.type === "candidate-pair" && report.selected) {
+          return report;
+        }
+      }
+
+      return null;
+    }
+
+    function outboundRtp(stats) {
+      for (const report of stats.values()) {
+        if (report.type === "outbound-rtp" && report.kind === "audio" && !report.isRemote) {
+          return report;
+        }
+      }
+
+      return null;
+    }
+
+    async function debugSnapshot() {
+      if (!pc) return "";
+
+      const stats = await pc.getStats();
+      const pair = selectedCandidatePair(stats);
+      const rtp = outboundRtp(stats);
+      const sender = pc.getSenders ? pc.getSenders()[0] : null;
+      const transport = sender && sender.transport ? sender.transport : null;
+      const transceiver = pc.getTransceivers ? pc.getTransceivers()[0] : null;
+      const track = senderTrack();
+
+      return (
+        " | debug" +
+        " mic=" + (useMic ? "1" : "0") +
+        " dc=" + (useDc ? "1" : "0") +
+        " dcState=" + dcState +
+        " codec=" + codec +
+        " dir=" + fmtValue(transceiver && transceiver.currentDirection) +
+        " transport=" + fmtValue(transport && transport.state) +
+        " track=" + fmtValue(track && track.readyState) +
+        " enabled=" + fmtBool(track && track.enabled) +
+        " muted=" + fmtBool(track && track.muted) +
+        " outboundRtp=" + fmtValue(rtp && rtp.packetsSent) +
+        " selectedPairPackets=" + fmtValue(pair && pair.packetsSent) +
+        " selectedPairBytes=" + fmtValue(pair && pair.bytesSent)
+      );
+    }
+
+    async function run() {
+      try {
+        setStatus("Creating peer connection...");
+        pc = new RTCPeerConnection({ iceServers: iceServers });
+        if (useDc) {
+          dc = pc.createDataChannel("spike");
+          dc.onopen = () => {
+            dcState = "open";
+            try { dc.send("ping"); } catch (_) {}
+          };
+          dc.onmessage = (ev) => {
+            dcState = "echo:" + String(ev.data);
+            setStatus("DataChannel echo: " + String(ev.data));
+          };
+          dc.onclose = () => { dcState = "closed"; };
+          dc.onerror = () => { dcState = "error"; };
+        }
+        if (useMic) {
+          // getUserMedia needs a secure context (https or localhost). Plain
+          // http://192.168.x.x leaves navigator.mediaDevices undefined.
+          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            throw new Error(
+              "Microphone needs a secure context. Use http://127.0.0.1:8080/, " +
+                "or Chrome flag unsafely-treat-insecure-origin-as-secure for this origin, " +
+                "or drop ?mic=1 (dtls-only)."
+            );
+          }
+          setStatus("Requesting microphone...");
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+        } else {
+          pc.addTransceiver("audio", { direction: "sendonly" });
+        }
+
+        pc.onicecandidate = async (ev) => {
+          if (!ev.candidate) {
+            await postCandidate({ end_of_candidates: true, mid: "0" });
+            return;
+          }
+          const mid = ev.candidate.sdpMid || "0";
+          await postCandidate({ candidate: ev.candidate.candidate, mid: mid });
+        };
+
+        pc.oniceconnectionstatechange = showPcState;
+        pc.onconnectionstatechange = showPcState;
+
+        setStatus("Creating offer...");
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        setStatus("Waiting for answer (codec=" + codec + ")...");
+        const resp = await fetch("/offer", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/sdp",
+            "X-Spike-Codec": codec
+          },
+          body: offer.sdp
+        });
+
+        if (!resp.ok) throw new Error("POST /offer " + resp.status);
+        const answer = await resp.text();
+        await pc.setRemoteDescription({ type: "answer", sdp: answer });
+        serverTrickleSince = 0;
+        await pollServerCandidates();
+        showPcState();
+
+        setInterval(async () => {
+          try {
+            await pollServerCandidates();
+            const srv = await fetch("/status").then((r) => r.text());
+            lastDebug = await debugSnapshot();
+            setStatus(
+              "ICE: " +
+                pc.iceConnectionState +
+                " / conn: " +
+                pc.connectionState +
+                " | server " +
+                srv +
+                lastDebug
+            );
+          } catch (_) {
+            showPcState();
+          }
+        }, 1000);
+      } catch (err) {
+        setStatus("Error: " + err);
+        console.error(err);
+      }
+    }
+
+    window.addEventListener("beforeunload", () => {
+      if (pc) pc.close();
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+    });
+
+    run();
+  </script>
+</body>
+</html>
